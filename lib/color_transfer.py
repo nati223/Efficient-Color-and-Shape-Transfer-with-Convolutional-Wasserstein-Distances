@@ -1,14 +1,8 @@
 import numpy as np
 from skimage import io, color
 from scipy.spatial import cKDTree
+from lib.algorithms import wasserstein_barycente
 
-# -----------------------------
-# 1) Re-use your algorithms.py
-# -----------------------------
-from lib.algorithms import (
-    wasserstein_barycenter,  # entropic-regularized barycenter
-    entropy,                 # if you want to measure distribution entropy
-)
 
 def match_l_channel(L_src, L_tgt):
     """
