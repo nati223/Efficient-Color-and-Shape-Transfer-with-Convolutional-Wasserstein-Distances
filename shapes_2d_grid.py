@@ -7,7 +7,7 @@ from utils.shapes_2d import create_shape
 # Define grid size and gamma for heat kernel
 image_shape = (128, 128)
 gamma = 0.001  # Regularization parameter
-entropy_reg = 0.1
+entropy_reg = None  # Entropy regularization parameter
 interp_num = 5
 
 # Define the 4 corner shapes
@@ -29,7 +29,6 @@ v1 = np.array((1, 0, 0, 0))
 v2 = np.array((0, 1, 0, 0))
 v3 = np.array((0, 0, 1, 0))
 v4 = np.array((0, 0, 0, 1))
-
 
 # Loop over the grid with bilinear interpolation
 for i in range(interp_num):
@@ -55,7 +54,7 @@ for i in range(interp_num):
             axes[i, j].imshow(f4, cmap="gray")
         else:
             # Compute barycenter for intermediate shapes
-            mu_interp, _, _ = convolutional_wasserstein_barycenter(A, gamma, weights, stop_threshold=1e-5, verbose=True)
+            mu_interp, _, _, _ = convolutional_wasserstein_barycenter(A, gamma, weights, stop_threshold=1e-5, verbose=True, entropy_sharpening=True, max_iterations=2000, H0=entropy_reg)
             axes[i, j].imshow(mu_interp.reshape(image_shape), cmap="gray")
 
         axes[i, j].axis("off")
