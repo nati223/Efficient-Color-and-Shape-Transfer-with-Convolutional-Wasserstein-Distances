@@ -2,7 +2,7 @@ import numpy as np
 from skimage import io, color
 from scipy.spatial import cKDTree
 # from lib.algorithms import wasserstein_barycenter, wasserstein_barycenter_stable
-from lib.algo import convolutional_wasserstein_barycenter
+from lib.algorithms import convolutional_wasserstein_barycenter
 from scipy.spatial.distance import cdist
 import matplotlib.pyplot as plt
 import ot
@@ -50,6 +50,7 @@ def compute_gamma(mu_list, percentile=0.1):
     gamma = (percentile / 100) * median_cost
     return gamma
 
+
 def match_l_channel(L_src, L_tgt):
     """
     Simple 1D histogram matching for the L channel in Lab space.
@@ -71,6 +72,7 @@ def match_l_channel(L_src, L_tgt):
     idx = np.clip((ranks*(n-1)).astype(int), 0, n-1)
     L_out = Lt_sorted[idx]
     return L_out.reshape(orig_shape)
+
 
 def make_ab_histogram(img_lab, n_bins=64):
     """
@@ -133,10 +135,6 @@ def compute_transport_map(source_bins_grid, target_bins_grid, V, W, gamma):
     V = V.ravel()
     W = W.ravel()
     
-    print("K shape:", K.shape)
-    print("V shape:", V.shape)
-    print("W shape:", W.shape)
-
     # Compute transport plan
     transport_plan = np.einsum("ij,i,j->ij", K, V, W)
 
@@ -149,15 +147,6 @@ def compute_transport_map(source_bins_grid, target_bins_grid, V, W, gamma):
 
     return transport_map
 
-# def apply_transport_map(source_lab, transport_map, source_bins, bins):
-#     transformed_lab = source_lab.copy().astype(np.float32)
-#     for i in range(transformed_lab.shape[0]):
-#         for j in range(transformed_lab.shape[1]):
-#             a_idx = np.argmin(np.abs(source_bins[0] - transformed_lab[i, j, 1]))
-#             b_idx = np.argmin(np.abs(source_bins[1] - transformed_lab[i, j, 2]))
-#             index = a_idx * bins + b_idx  
-#             transformed_lab[i, j, 1:] = transport_map[index]
-#     return transformed_lab
 
 def apply_transport_map_knn(img_ab, bin_centers, Tmap, k=4, eps=1e-8):
     """
@@ -206,8 +195,6 @@ def apply_transport_map(img_ab, bin_centers, Tmap):
     """
     H,W,_ = img_ab.shape
     out_ab = np.zeros_like(img_ab)
-    for i in range(10):  # Print first 10 assigned values
-        print(f"Pixel {i}: Original AB {img_ab.reshape(-1,2)[i]}, Mapped AB {Tmap[i]}")
     
     # Build a KD-Tree over bin_centers
     tree = cKDTree(bin_centers)
@@ -250,10 +237,12 @@ def color_transfer(
     lab_src = color.rgb2lab(src_rgb)
     lab_tgt = color.rgb2lab(tgt_rgb)
     
-    # Possibly match the L channel from src to tgt
+    # Optional: match l_channels
     if match_l:
         L_src_matched = match_l_channel(lab_src[...,0], lab_tgt[...,0])
         lab_src[...,0] = L_src_matched
+        L_tgt_matched = match_l_channel(lab_tgt[...,0], lab_src[...,0])
+        lab_tgt[...,0] = L_tgt_matched
     
     # Build ab histograms
     hist_src, bc_src, shape2D = make_ab_histogram(lab_src, n_bins=n_bins)
@@ -261,50 +250,25 @@ def color_transfer(
     mu_list = np.array([hist_src, hist_tgt])
     # Reshape mu_list to (2, n_bins, n_bins)
     mu_list = mu_list.reshape(2, n_bins, n_bins)
-    
-    print("Source AB range:",
-      lab_src[...,1].min(), lab_src[...,1].max(),
-      lab_src[...,2].min(), lab_src[...,2].max())
-
-    print("Target AB range:",
-      lab_tgt[...,1].min(), lab_tgt[...,1].max(),
-      lab_tgt[...,2].min(), lab_tgt[...,2].max())
-    
-    print("Nonzero bins (source):", np.count_nonzero(hist_src))
-    print("Nonzero bins (target):", np.count_nonzero(hist_tgt))
-    
+        
     # Barycenter with alpha=[(1-t), t]
     alpha_list = np.array([1.0 - t, t])
-    
-    # gamma = compute_gamma(mu_list, 1)
-    # print(f"gamma is {gamma}")
     
     # Use your existing 'wasserstein_barycenter' function from algorithms.py
     mu_bar, v_list, w_list, K = convolutional_wasserstein_barycenter(
         distributions=mu_list,
         weights=alpha_list,
         gamma=gamma,
-        verbose=True,
+        verbose=False,
         max_iterations=max_iter,
         stop_threshold=tol,
     )
     
-    plot_2d_histogram(hist_src.reshape(shape2D))
-    plot_2d_histogram(hist_tgt.reshape(shape2D))
-    plot_2d_histogram(mu_bar.reshape(shape2D))
-    
-    print("Sum of mu_bar:", np.sum(mu_bar))
-    
-    # v_list[0], w_list[0] => plan for distribution #0 => the barycenter
-    # v_list[1], w_list[1] => plan for distribution #1 => the barycenter
-    # We'll build Tmap for each distribution => barycenter
-    #   T_i(x) = sum_y pi_i(x,y)*y / sum_y pi_i(x,y)
-    # where pi_i = diag(v_i)*K*diag(w_i). 
-    
-    # T_src = build_transport_map(v_list[0], w_list[0], bc_src, sigma)
-    # T_tgt = build_transport_map(v_list[1], w_list[1], bc_tgt, sigma)
-    # T_src = build_transport_map(hist_src, v_list[0].ravel(), w_list[0].ravel(), bc_src, gamma, K)
-    # T_tgt = build_transport_map(hist_tgt, v_list[1].ravel(), w_list[1].ravel(), bc_tgt, gamma, K)
+    # NOTE: Commented, can be useful for debugging
+    # plot_2d_histogram(hist_src.reshape(shape2D))
+    # plot_2d_histogram(hist_tgt.reshape(shape2D))
+    # plot_2d_histogram(mu_bar.reshape(shape2D))
+        
     T_src = compute_transport_map(bc_src, bc_tgt, v_list[0], w_list[0], gamma)
     T_tgt = compute_transport_map(bc_tgt, bc_src, v_list[1], w_list[1], gamma)
     hist_src += 1e-8  # Add a tiny mass to avoid zero bins
@@ -312,35 +276,16 @@ def color_transfer(
     mu_bar += 1e-8  # Ensure barycenter also has mass
     hist_src /= np.sum(hist_src)
     hist_tgt /= np.sum(hist_tgt)
-
-    cost_matrix = np.clip(cdist(bc_src, bc_tgt, metric="sqeuclidean"), 1e-6, 100)  # Limit extreme values
-    # transport_src = ot.sinkhorn(hist_src, mu_bar.flatten(), cost_matrix, reg=0.1)
-    # transport_tgt = ot.sinkhorn(hist_tgt, mu_bar.flatten(), cost_matrix, reg=0.1)
-    
-    # T_src = transport_src @ bc_tgt
-    # T_tgt = transport_tgt @ bc_src
-    
-    print("Finished Building Transport Maps")
-    
+        
     # Apply Tmaps
     ab_src = lab_src[...,1:3]
     out_src_ab = apply_transport_map(ab_src, bc_src, T_src)
-    print("Applied Tmap on source")
     out_src_lab = np.dstack([lab_src[...,0], out_src_ab])
-    print("Min/Max of final Lab image: L in [", out_src_lab[...,0].min(), 
-    ",", out_src_lab[...,0].max(), "]",
-    " a in [", out_src_lab[...,1].min(), ",", out_src_lab[...,1].max(), "]",
-    " b in [", out_src_lab[...,2].min(), ",", out_src_lab[...,2].max(), "]")
     out_src_rgb = color.lab2rgb(out_src_lab)
     
     ab_tgt = lab_tgt[...,1:3]
     out_tgt_ab = apply_transport_map(ab_tgt, bc_tgt, T_tgt)
-    print("Applied Tmap on target")
     out_tgt_lab = np.dstack([lab_tgt[...,0], out_tgt_ab])
-    print("Min/Max of final Lab image: L in [", out_tgt_lab[...,0].min(), 
-    ",", out_src_lab[...,0].max(), "]",
-    " a in [", out_tgt_lab[...,1].min(), ",", out_tgt_lab[...,1].max(), "]",
-    " b in [", out_tgt_lab[...,2].min(), ",", out_tgt_lab[...,2].max(), "]")
     out_tgt_rgb = color.lab2rgb(out_tgt_lab)
     
     return out_src_rgb, out_tgt_rgb, mu_bar

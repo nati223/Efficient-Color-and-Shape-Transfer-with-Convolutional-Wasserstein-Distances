@@ -1,560 +1,296 @@
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.optimize import root_scalar
 
-def heat_kernel_convolution(f, sigma, image_shape):
+def compute_entropy_and_mass(b, stability_threshold=1e-30):
     """
-    Applies the heat kernel (approximated by a Gaussian filter) to vector f.
-    
-    Parameters:
-      f           : 1D numpy array representing a function on the domain.
-      sigma       : Standard deviation for the Gaussian (controls diffusion).
-      image_shape : Tuple indicating the dimensions of the image (e.g., (128, 128)).
-    
-    Returns:
-      A 1D numpy array (flattened) representing the convolution result.
+    Compute the entropy H(b) = - sum( b * ln(b) )
+    and total mass sum(b) for a 2D array b.
     """
-    f_img = f.reshape(image_shape)
-    conv_img = gaussian_filter(f_img, sigma=sigma)
-    return conv_img.flatten()
+    clipped = np.maximum(b, stability_threshold)
+    entropy = -np.sum(clipped * np.log(clipped))
+    total_mass = np.sum(b)
+    return entropy, total_mass
 
-def sinkhorn(mu0, mu1, image_shape, sigma, tol=1e-6, max_iter=1000):
-    """
-    Implements the Sinkhorn iterations for the convolutional Wasserstein distance.
-    
-    Parameters:
-      mu0, mu1    : 1D numpy arrays representing the source and target probability distributions.
-      image_shape : Tuple of ints (e.g., (128, 128)).
-      sigma       : Standard deviation for the Gaussian convolution (heat kernel approximation).
-      tol         : Convergence tolerance.
-      max_iter    : Maximum number of iterations.
-    
-    Returns:
-      v, w        : Scaling vectors such that the transport plan is given by diag(v) @ H_t @ diag(w).
-    """
-    n = mu0.size
-    # For images, area weights are typically uniform.
-    a = np.full_like(mu0, 1.0 / n)
-    
-    # Initialize scaling vectors to ones.
-    v = np.ones_like(mu0)
-    w = np.ones_like(mu1)
-    
-    for i in range(max_iter):
-        v_prev = v.copy()
-        
-        # Update v: divide mu0 by the convolution of (w * a)
-        Hv_w = heat_kernel_convolution(w * a, sigma, image_shape)
-        # Avoid division by zero.
-        Hv_w[Hv_w == 0] = 1e-16
-        v = mu0 / Hv_w
-        
-        # Update w: divide mu1 by the convolution of (v * a)
-        Hv_v = heat_kernel_convolution(v * a, sigma, image_shape)
-        Hv_v[Hv_v == 0] = 1e-16
-        w = mu1 / Hv_v
-        
-        # Check for convergence (using L1 norm on the change in v)
-        if np.linalg.norm(v - v_prev, 1) < tol:
-            print(f"Sinkhorn converged in {i+1} iterations.")
-            break
-    else:
-        print("Maximum iterations reached without full convergence.")
-    
-    return v, w, a
+def compute_H0(distributions):
+    entropies = []
+    for i in range(len(distributions)):
+        Hi, mi = compute_entropy_and_mass(distributions[i])
+        entropies.append(Hi)
 
-def compute_convolutional_distance(mu0, mu1, v, w, a, gamma):
-    """
-    Computes the regularized Wasserstein distance (squared) based on the scaling factors.
-    
-    Uses the formula:
-      W² ≈ gamma * aᵀ[(mu0 * ln(v)) + (mu1 * ln(w))]
-    
-    Parameters:
-      mu0, mu1 : Source and target distributions (1D numpy arrays).
-      v, w     : Scaling vectors from the Sinkhorn iterations.
-      a        : Area weights.
-      gamma    : Regularization parameter.
-      
-    Returns:
-      The approximate regularized Wasserstein distance (squared).
-    """
-    # To avoid log(0), use a small constant.
-    log_v = np.log(np.maximum(v, 1e-16))
-    log_w = np.log(np.maximum(w, 1e-16))
-    return gamma * np.dot(a, mu0 * log_v + mu1 * log_w)
+    return max(entropies)
 
-def heat_kernel_convolution(f, sigma, image_shape):
+def sharpening_find_beta(
+    b,
+    H0,
+    stability_threshold=1e-30,
+    bracket=(0.0, 50.0),
+    max_bracket=50.0,
+    method='bisect',
+    x0=1.0,
+    max_iter=50,
+    tol=1e-8
+):
     """
-    Applies the heat kernel (approximated by a Gaussian filter)
-    to vector f, reshaping it to an image of shape image_shape.
-    
-    Parameters:
-      f           : 1D numpy array.
-      sigma       : Standard deviation for the Gaussian filter.
-      image_shape : Tuple (height, width) of the image.
-    
-    Returns:
-      Flattened array of the convolution result.
-    """
-    f_img = f.reshape(image_shape)
-    conv_img = gaussian_filter(f_img, sigma=sigma)
-    return conv_img.flatten()
+    Returns beta >= 0 such that H(b^beta) + sum(b^beta) = H0 + 1, if possible.
+    Otherwise returns 1.0 if no suitable beta.
 
-def wasserstein_barycenter(mu_list, alpha_list, image_shape, sigma,
-                           tol=1e-6, max_iter=200, 
-                           sharpen_entropy=None,  # <= new param
-                           verbose=True):
-    """
-    Computes the entropic Wasserstein barycenter of the distributions in mu_list,
-    with weights alpha_list (which should sum to 1).  We approximate the cost
-    using a heat-kernel (Gaussian) with std= sigma, discretized as image_shape.
-    
-    If sharpen_entropy is not None (a float), we clamp the barycenter's entropy
-    at each iteration so that H(mu) ≤ sharpen_entropy.
-    """
-    # We assume all mu_list[i] have the same length n = image_shape[0]*image_shape[1]
-    n = mu_list[0].size
-    k = len(mu_list)
-    # area weights a for each "pixel/bin" => uniform
-    a = np.full(n, 1.0/n)
+    Parameters
+    ----------
+    b : 2D array
+        The current barycenter or distribution we want to sharpen.
+    H0 : float
+        Entropy bound: We want H(b^beta)+sum(b^beta) <= H0 + 1.
+    stability_threshold : float
+        For numerical stability in logs and divisions.
+    bracket : tuple (low, high)
+        Initial bracket for bracket-based methods.
+    max_bracket : float
+        We'll expand 'high' if needed, up to this limit.
+    method : str
+        One of {'bisect', 'brentq', 'ridder', 'newton', 'secant'}, etc.
+    x0 : float
+        Initial guess for derivative-based methods like 'newton', 'secant'.
+    max_iter : int
+        Maximum iterations in the root-finder.
+    tol : float
+        Tolerance on the solution.
 
-    # Build v_i,w_i = 1, for each i
-    v_list = [np.ones(n) for _ in range(k)]
-    w_list = [np.ones(n) for _ in range(k)]
-    
-    # Start barycenter mu_bar as uniform
-    mu_bar = np.full(n, 1.0/n)
- 
-    # main iteration
-    for it in range(max_iter):
-        mu_bar_old = mu_bar.copy()
-        
-        # Projection onto constraints fixing the 'column marginal' = mu_list[i]
-        # => update w_i
-        d_list = []
-        for i in range(k):
-            # w_i <- mu_list[i] / heat_conv(v_i * mu_bar)
-            Hv = heat_kernel_convolution(v_list[i] * mu_bar, sigma, image_shape)
-            Hv = np.maximum(Hv, 1e-16)
-            w_list[i] = mu_list[i] / Hv
-        
-        # Now gather d_i = v_i * heat_conv(w_i * mu_bar)
-        for i in range(k):
-            conv_i = heat_kernel_convolution(w_list[i] * mu_bar, sigma, image_shape)
-            d_i = v_list[i] * conv_i
-            d_list.append(d_i)
-        
-        # Weighted geometric mean => new mu_bar
-        # mu_bar = product_{i=1..k} ( d_i ^ alpha_i )
-        mu_bar[:] = 1.0
-        for i in range(k):
-            alpha_i = alpha_list[i]
-            # d_i^alpha_i
-            mu_bar *= d_list[i] ** alpha_i
-        sum_mb = mu_bar.sum()
-        if sum_mb < 1e-16:
-            # fallback to uniform if degenerate
-            mu_bar[:] = 1.0/n
+    Returns
+    -------
+    beta : float
+        If the function doesn't find a root, returns 1.0.
+        If it does, returns the solution in [0,inf).
+    """
+
+    def f(beta):
+        # b^beta
+        safe_b = np.maximum(b, stability_threshold)
+        bbeta = np.power(safe_b, beta)
+        # sum(b^beta)
+        mass = bbeta.sum()
+        # H(b^beta) = - beta sum( b^beta ln(b) )
+        ln_b = np.log(safe_b)
+        entropy = -beta * np.sum(bbeta * ln_b)
+        return entropy + mass - (H0 + 1)
+
+    def fprime(beta):
+        # derivative of f w.r.t beta
+        # f'(beta) = derivative of [entropy + mass] wrt beta
+        # mass' = sum( b^beta ln b )
+        # entropy' -> final closed form = - beta sum(b^beta (ln b)^2)
+        safe_b = np.maximum(b, stability_threshold)
+        bbeta = np.power(safe_b, beta)
+        ln_b = np.log(safe_b)
+        sum_bbeta_ln2 = np.sum(bbeta * (ln_b**2))
+        return -beta * sum_bbeta_ln2
+
+    # Quick check: if f(1) <= 0 => no sharpening needed
+    val_at_1 = f(1.0)
+    if val_at_1 <= 0.0:
+        return 1.0
+
+    # For bracket-based methods, do the bracket expansion logic
+    if method in ('bisect', 'brentq', 'ridder'):
+        low, high = bracket
+        val_low, val_high = f(low), f(high)
+
+        # If f(low) > 0 => no solution in [low,1], fallback
+        if val_low > 0:
+            return 1.0
+
+        # expand if needed
+        while val_high < 0 and high < max_bracket:
+            high *= 2.0
+            val_high = f(high)
+        if val_high < 0:
+            # no sign change in [low, max_bracket]
+            return 1.0
+
+        # Now we can solve in [low, high]
+        sol = root_scalar(f, bracket=(low, high), method=method, maxiter=max_iter, rtol=tol)
+        if sol.converged:
+            return max(sol.root, 0.0)
         else:
-            mu_bar /= sum_mb
+            return 1.0
+
+    elif method in ('newton', 'secant'):
+        # derivative-based method => we pass fprime if 'newton'
+        kwargs = dict(x0=x0, maxiter=max_iter, rtol=tol)
+        if method == 'newton':
+            sol = root_scalar(f, fprime=fprime, method='newton', **kwargs)
+        else:  # 'secant'
+            sol = root_scalar(f, x1=x0*1.1, method='secant', **kwargs)  # you can adapt x1
+
+        if sol.converged and sol.root >= 0.0:
+            return sol.root
+        else:
+            # fallback
+            return 1.0
+
+    else:
+        raise ValueError(f"Unknown method '{method}'; must be bracket-based or derivative-based.")
+
+
+def entropic_sharpening(b, H0, stability_threshold=1e-30):
+    """
+    If H(b) + sum(b) > H0 + 1, exponentiate b by some beta < 1 to reduce entropy.
+
+    Implements the logic from Algorithm 3 in the Solomon et al. paper,
+    but with a SciPy-based root find for the exponent beta.
+    """
+    curr_entropy, curr_mass = compute_entropy_and_mass(b, stability_threshold=stability_threshold)
+    diff = (curr_entropy + curr_mass) - (H0 + 1.0)
+    
+    # Print how far above the threshold we are
+    # print(f"[Sharpening]  H(b)+sum(b)={curr_entropy+curr_mass:.4f}, "
+    #       f"H0+1={H0+1:.4f}, diff={diff:.4e}")
+    
+    # Compute current H(b)+sum(b)
+    curr_entropy, curr_mass = compute_entropy_and_mass(b, stability_threshold=stability_threshold)
+    if diff < 0:
+        # Already satisfies the constraint => no change
+        # print("[Sharpening]  No sharpening needed.")
+        return b
+
+    # Otherwise solve for beta
+    beta = sharpening_find_beta(b, H0, stability_threshold=stability_threshold, method='newton')
+    if abs(beta - 1.0) < 1e-12:
+        # print(f"[Sharpening]  Beta ~ 1 => no major exponent change.")
+        # means no solution or no need to sharpen
+        return b
+
+    # Exponentiate
+    safe_b = np.maximum(b, stability_threshold)
+    b_sharp = np.power(safe_b, beta)
+    # print(f"[Sharpening]  Sharpening with beta={beta:.6f}")
+    return b_sharp
+
+
+def convolutional_wasserstein_barycenter(
+    distributions,
+    gamma,
+    weights=None,
+    max_iterations=10000,
+    stop_threshold=1e-9,
+    stability_threshold=1e-30,
+    verbose=False,
+    log_output=False,
+    warn=True,
+    H0 = None,
+    entropy_sharpening=False,
+):
+    """
+    Compute the entropic regularized Wasserstein barycenter of a collection of 2D distributions.
+
+    Parameters:
+    ----------
+    distributions : list or np.ndarray
+        A collection of 2D probability distributions (images).
+    gamma : float
+        Entropic regularization parameter.
+    weights : np.ndarray, optional
+        Weights for each distribution, default is uniform.
+    max_iterations : int, optional
+        Maximum number of iterations, default is 10000.
+    stop_threshold : float, optional
+        Convergence threshold, default is 1e-9.
+    stability_threshold : float, optional
+        Small stability value to prevent numerical issues, default is 1e-30.
+    verbose : bool, optional
+        If True, print progress during iterations.
+    log_output : bool, optional
+        If True, return additional log details.
+    warn : bool, optional
+        If True, warns if the algorithm does not converge.
+
+    Returns:
+    -------
+    barycenter : np.ndarray
+        The computed Wasserstein barycenter.
+    v : np.ndarray
+        Scaling factors corresponding to the input distributions.
+    w : np.ndarray
+        Scaling factors corresponding to the convolution operation.
+    log : dict (optional)
+        Contains iteration errors if log_output is True.
+    """
+
+    distributions = np.array(distributions)
+    if (len(distributions.shape) == 2):
+        distributions = np.reshape(distributions, (int(distributions.shape[0]), int(distributions.shape[1]**0.5), int(distributions.shape[1]**0.5)))
+    num_distributions, height, width = distributions.shape
+
+    if weights is None:
+        weights = np.full(num_distributions, 1 / num_distributions)
+    else:
+        assert len(weights) == num_distributions, "Weights must match number of distributions."
+
+    if log_output:
+        log = {"errors": []}
+
+    barycenter = np.ones((height, width)) / (height * width)
+    v = np.ones_like(distributions)  # Scaling factor v in Algorithm 2
+    w = np.ones_like(distributions)  # Scaling factor w in Algorithm 2
+    error = float("inf")
+    prev_error = float("inf")
+    
+    # Initialize entropy bound H0
+    H0 = compute_H0(distributions) if H0 is None else H0
+
+    # Construct the convolution kernel using Gaussian approximation
+    x = np.linspace(0, 1, height)
+    X, Y = np.meshgrid(x, x)
+    heat_kernel = np.exp(-((X - Y) ** 2) / gamma)
+
+    def convolve_images(images):
+        """Applies separable convolution using kernel_x and kernel_y."""
+        intermediate = np.einsum("ij,bjk->bik", heat_kernel, images)
+        return np.einsum("ij,bkj->bki", heat_kernel, intermediate)
+
+    Kv = convolve_images(v)
+
+    for iteration in range(max_iterations):
+        # w = barycenter[None, :, :] / Kv
+        w = np.exp(np.log(np.maximum(barycenter[None, :, :], stability_threshold)) - np.log(np.maximum(Kv, stability_threshold)))
+        Kw = convolve_images(w)
+        v = np.exp(np.log(np.maximum(distributions, stability_threshold)) - np.log(np.maximum(Kw, stability_threshold)))
+        Kv = convolve_images(v)
+
+        # Compute barycenter update
+        log_Kv = np.log(np.maximum(Kv, stability_threshold))
+        barycenter = np.exp(np.sum(weights[:, None, None] * log_Kv, axis=0))
         
-        # -------------- Entropy Sharpening Step --------------
-        if sharpen_entropy is not None:
-            # clamp mu_bar's entropy to sharpen_entropy
-            mu_bar = entropic_sharpening(mu_bar, a, sharpen_entropy, tol=1e-7, max_iter=100)
-        # -----------------------------------------------------
-        
-        # Projection onto constraints that all row marginals = mu_bar
-        # => update v_i
-        for i in range(k):
-            d_i = np.maximum(d_list[i], 1e-16)
-            v_list[i] = v_list[i] * (mu_bar / d_i)
-        
+        prev_error = error
+        error = np.sum(np.std(w * Kv, axis=0))
+
+        # Apply entropy sharpening if enabled
+        if entropy_sharpening:
+            prev_barycenter = barycenter
+            barycenter = entropic_sharpening(barycenter, H0)
+            if (error > 1.1 * prev_error):
+                if log_output:
+                    log["iterations"] = iteration
+                    return prev_barycenter, v, w, log
+                else:
+                    return prev_barycenter, v, w, heat_kernel
+            
         # Check for convergence
-        diff = np.linalg.norm(mu_bar - mu_bar_old, 1)
-        if verbose and (it%10==0 or diff<tol):
-            print(f"[Iter {it}] barycenter L1 change={diff:.3e}")
-        if diff < tol:
-            break
-    
-    return mu_bar, v_list, w_list
-
-
-def displacement_interpolation(mu0, mu1, t, image_shape, sigma, tol=1e-6, max_iter=200, verbose=False):
-    """
-    Computes the displacement interpolation (Wasserstein interpolation) between two distributions
-    mu0 and mu1 for a given t in [0,1] using the barycenter approach.
-    
-    Parameters:
-      mu0, mu1   : 1D numpy arrays (flattened) representing the two input distributions.
-      t          : Interpolation parameter between 0 and 1.
-      image_shape: Tuple representing the image dimensions, e.g., (128, 128).
-      sigma      : Standard deviation for the Gaussian convolution (heat kernel approximation).
-      tol        : Tolerance for the barycenter iteration convergence.
-      max_iter   : Maximum number of iterations for barycenter computation.
-      verbose    : If True, print convergence details.
-      
-    Returns:
-      mu_t       : The interpolated distribution as a 1D numpy array (flattened).
-    """
-    # For two distributions, set barycenter weights [1-t, t]
-    alpha_list = [1 - t, t]
-    mu_list = [mu0, mu1]
-    
-    # Call the wasserstein_barycenter function (from our barycenter module)
-    mu_bar, _, _ = wasserstein_barycenter(mu_list, alpha_list, image_shape, sigma, tol, max_iter, verbose)
-    return mu_bar
-
-def wasserstein_propagation(vertices, edges, fixed, mu_fixed, image_shape, sigma, tol=1e-6, max_iter=100, verbose=True):
-    """
-    Propagates distributions on a graph using Wasserstein propagation via iterated Bregman projections.
-    
-    Parameters:
-      vertices   : List of vertex indices.
-      edges      : List of tuples (v, w, weight) representing directed edges from v to w.
-      fixed      : List or set of vertices that have fixed distributions.
-      mu_fixed   : Dictionary mapping each fixed vertex to its distribution (flattened, normalized).
-      image_shape: Tuple (height, width) specifying the grid dimensions.
-      sigma      : Standard deviation for the Gaussian (heat kernel approximation).
-      tol        : Convergence tolerance (based on L1 change on unknown vertices).
-      max_iter   : Maximum number of iterations.
-      verbose    : If True, prints diagnostic messages.
-      
-    Returns:
-      mu         : Dictionary mapping each vertex to its propagated distribution.
-    """
-    n = np.prod(image_shape)
-    # Uniform area weights (for images, each pixel has weight 1/n)
-    a = np.full(n, 1.0 / n)
-    
-    # Initialize distributions for all vertices.
-    mu = {}
-    for v in vertices:
-        if v in fixed:
-            mu[v] = mu_fixed[v]
-        else:
-            # Start with a uniform distribution.
-            temp = np.ones(n)
-            mu[v] = temp / np.dot(a, temp)
-    
-    # Initialize scaling factors for each edge.
-    # For each edge (v, w, weight), we store scaling factors in a dictionary.
-    edge_scaling = {}
-    for (v, w, weight) in edges:
-        edge_scaling[(v, w)] = {"v": np.ones(n), "w": np.ones(n)}
-    
-    # Build a neighbor mapping: for each vertex, store incident edges.
-    # For each vertex, store a list of tuples (neighbor, edge, direction, weight)
-    # 'out' means edge (v, nbr) leaving v; 'in' means edge (nbr, v) entering v.
-    neighbors = {v: [] for v in vertices}
-    for (v, w, weight) in edges:
-        neighbors[v].append((w, (v, w), 'out', weight))
-        neighbors[w].append((v, (v, w), 'in', weight))
-    
-    # Main propagation loop.
-    for it in range(max_iter):
-        # Save previous distributions for unknown vertices to monitor convergence.
-        mu_prev = {v: mu[v].copy() for v in vertices if v not in fixed}
-        
-        for v in vertices:
-            if v in fixed:
-                # For fixed vertices, enforce the given distribution.
-                mu[v] = mu_fixed[v]
-                # Update scaling factors on incident edges.
-                for (nbr, edge, direction, weight) in neighbors[v]:
-                    if direction == 'in':  # edge (nbr, v)
-                        v_factor = edge_scaling[edge]["v"]
-                        conv_val = heat_kernel_convolution(v_factor * a, sigma, image_shape)
-                        conv_val[conv_val == 0] = 1e-16
-                        edge_scaling[edge]["w"] = mu[v] / conv_val
-                    elif direction == 'out':  # edge (v, nbr)
-                        w_factor = edge_scaling[edge]["w"]
-                        conv_val = heat_kernel_convolution(w_factor * a, sigma, image_shape)
-                        conv_val[conv_val == 0] = 1e-16
-                        edge_scaling[edge]["v"] = mu[v] / conv_val
-            else:
-                # For an unknown vertex, combine information from all incident edges.
-                d_list = []    # list to store d_e for each incident edge
-                weight_list = []  # corresponding edge weights
-                for (nbr, edge, direction, weight) in neighbors[v]:
-                    if direction == 'in':  # edge (nbr, v)
-                        # d_e = (w scaling) * H_t(a * (v scaling))
-                        v_factor = edge_scaling[edge]["v"]
-                        conv_val = heat_kernel_convolution(v_factor * a, sigma, image_shape)
-                        d_e = edge_scaling[edge]["w"] * conv_val
-                    elif direction == 'out':  # edge (v, nbr)
-                        w_factor = edge_scaling[edge]["w"]
-                        conv_val = heat_kernel_convolution(w_factor * a, sigma, image_shape)
-                        d_e = edge_scaling[edge]["v"] * conv_val
-                    d_list.append(np.maximum(d_e, 1e-16))  # avoid zeros
-                    weight_list.append(weight)
-                # Compute the weighted geometric mean:
-                omega = np.sum(weight_list)
-                mu_v_new = np.ones(n)
-                for d_e, w_e in zip(d_list, weight_list):
-                    mu_v_new *= d_e ** (w_e / omega)
-                # Normalize the new distribution so that a^T mu = 1.
-                mu[v] = mu_v_new / np.dot(a, mu_v_new)
-                
-                # Update scaling factors on all incident edges.
-                for (nbr, edge, direction, weight) in neighbors[v]:
-                    if direction == 'in':  # edge (nbr, v)
-                        v_factor = edge_scaling[edge]["v"]
-                        conv_val = heat_kernel_convolution(v_factor * a, sigma, image_shape)
-                        d_e = edge_scaling[edge]["w"] * np.maximum(conv_val, 1e-16)
-                        edge_scaling[edge]["w"] = edge_scaling[edge]["w"] * (mu[v] / d_e)
-                    elif direction == 'out':  # edge (v, nbr)
-                        w_factor = edge_scaling[edge]["w"]
-                        conv_val = heat_kernel_convolution(w_factor * a, sigma, image_shape)
-                        d_e = edge_scaling[edge]["v"] * np.maximum(conv_val, 1e-16)
-                        edge_scaling[edge]["v"] = edge_scaling[edge]["v"] * (mu[v] / d_e)
-        
-        # Compute convergence error for unknown vertices.
-        err = 0
-        count = 0
-        for v in vertices:
-            if v not in fixed:
-                err += np.linalg.norm(mu[v] - mu_prev[v], 1)
-                count += 1
-        avg_err = err / count if count > 0 else 0
-        if verbose:
-            print(f"Iteration {it+1}: Average L1 change on unknown vertices = {avg_err:.2e}")
-        if count > 0 and avg_err < tol:
+        if iteration % 10 == 9:
+            if log_output:
+                log["errors"].append(error)
             if verbose:
-                print("Propagation converged.")
-            break
+                if iteration % 200 == 0:
+                    print(f"{'Iter':<5} | {'Error':<12}\n" + "-" * 19)
+                print(f"{(1 + iteration):<5} | {error:.8e}")
+            if error < stop_threshold:
+                break
             
-    return mu
-
-def modified_heat_kernel_convolution(f, sigma, image_shape, compatibility, tau, gamma, N_v):
-    """
-    Applies a modified heat kernel convolution to f.
-    
-    The modification uses a diagonal scaling:
-      D = exp(-tau * compatibility / (gamma * N_v))
-    and computes the result as: 
-      result = D * H_t( f * D )
-      
-    Parameters:
-      f            : 1D numpy array.
-      sigma        : Gaussian std parameter.
-      image_shape  : Shape tuple for target grid.
-      compatibility: 1D numpy array of compatibility values at vertex v.
-      tau          : Parameter controlling the strength of the compatibility penalty.
-      gamma        : Regularization parameter.
-      N_v          : Valence (number of neighbors) of vertex v.
-      
-    Returns:
-      Modified convolution result (flattened).
-    """
-    D = np.exp(-tau * compatibility / (gamma * N_v))
-    f_mod = f * D
-    conv = gaussian_filter(f_mod.reshape(image_shape), sigma=sigma).flatten()
-    return conv * D
-
-def soft_maps_propagation(vertices, edges, fixed, mu_fixed, 
-                          compatibility, tau, gamma, image_shape, sigma, 
-                          tol=1e-6, max_iter=100, verbose=True):
-    """
-    Computes a measure-valued map (soft map) from source vertices (domain M0)
-    to a target domain M by propagating distributions using a modified
-    Wasserstein propagation algorithm.
-    
-    Parameters:
-      vertices    : List of vertex indices (source graph vertices).
-      edges       : List of tuples (v, w, weight) representing directed edges.
-      fixed       : List/set of vertices in M0 with fixed distributions.
-      mu_fixed    : Dictionary mapping each fixed vertex to its distribution 
-                    (flattened, normalized).
-      compatibility: Dictionary mapping each vertex v (in M0) to a 1D numpy array 
-                     of compatibility values on the target domain.
-      tau         : Parameter for the compatibility penalty.
-      gamma       : Regularization parameter.
-      image_shape : Tuple (height, width) of the target domain grid.
-      sigma       : Gaussian standard deviation for the heat kernel approximation.
-      tol         : Tolerance for convergence (L1 change on unknown vertices).
-      max_iter    : Maximum number of iterations.
-      verbose     : If True, prints progress messages.
-      
-    Returns:
-      mu          : Dictionary mapping each vertex v in M0 to its propagated 
-                    distribution (flattened, normalized).
-    """
-    n = np.prod(image_shape)
-    a = np.full(n, 1.0/n)  # uniform area weights on target domain
-    
-    # Initialize distributions on each vertex.
-    mu = {}
-    for v in vertices:
-        if v in fixed:
-            mu[v] = mu_fixed[v]
-        else:
-            temp = np.ones(n)
-            mu[v] = temp / np.dot(a, temp)
-    
-    # Initialize scaling factors for each edge.
-    edge_scaling = {}
-    for (v, w, weight) in edges:
-        edge_scaling[(v, w)] = {"v": np.ones(n), "w": np.ones(n)}
-    
-    # Build neighbor mapping.
-    neighbors = {v: [] for v in vertices}
-    for (v, w, weight) in edges:
-        neighbors[v].append((w, (v, w), 'out', weight))
-        neighbors[w].append((v, (v, w), 'in', weight))
-    
-    # Compute valence for each vertex (number of incident edges).
-    valence = {v: len(neighbors[v]) for v in vertices}
-    
-    # Main propagation loop.
-    for it in range(max_iter):
-        mu_prev = {v: mu[v].copy() for v in vertices if v not in fixed}
-        
-        for v in vertices:
-            if v in fixed:
-                mu[v] = mu_fixed[v]
-                # For fixed vertices, update scaling factors on incident edges (using standard kernel)
-                for (nbr, edge, direction, weight) in neighbors[v]:
-                    if direction == 'in':
-                        v_factor = edge_scaling[edge]["v"]
-                        conv_val = heat_kernel_convolution(v_factor * a, sigma, image_shape)
-                        conv_val[conv_val == 0] = 1e-16
-                        edge_scaling[edge]["w"] = mu[v] / conv_val
-                    elif direction == 'out':
-                        w_factor = edge_scaling[edge]["w"]
-                        conv_val = heat_kernel_convolution(w_factor * a, sigma, image_shape)
-                        conv_val[conv_val == 0] = 1e-16
-                        edge_scaling[edge]["v"] = mu[v] / conv_val
-            else:
-                # For an unknown vertex, use the compatibility function to modify updates.
-                d_list = []     # store modified d_e values for each incident edge
-                weight_list = []  # corresponding edge weights
-                # Use the compatibility vector for vertex v and its valence.
-                comp_v = compatibility[v]
-                N_v = valence[v] if valence[v] > 0 else 1
-                for (nbr, edge, direction, weight) in neighbors[v]:
-                    if direction == 'in':  # edge (nbr, v)
-                        # Compute d_e = (w scaling) * modified convolution of (v scaling * a)
-                        v_factor = edge_scaling[edge]["v"]
-                        conv_val = modified_heat_kernel_convolution(v_factor * a, sigma, image_shape, comp_v, tau, gamma, N_v)
-                        d_e = edge_scaling[edge]["w"] * np.maximum(conv_val, 1e-16)
-                    elif direction == 'out':  # edge (v, nbr)
-                        w_factor = edge_scaling[edge]["w"]
-                        conv_val = modified_heat_kernel_convolution(w_factor * a, sigma, image_shape, comp_v, tau, gamma, N_v)
-                        d_e = edge_scaling[edge]["v"] * np.maximum(conv_val, 1e-16)
-                    d_list.append(d_e)
-                    weight_list.append(weight)
-                # Compute the weighted geometric mean at vertex v.
-                omega = np.sum(weight_list)
-                mu_v_new = np.ones(n)
-                for d_e, w_e in zip(d_list, weight_list):
-                    mu_v_new *= d_e ** (w_e / omega)
-                mu[v] = mu_v_new / np.dot(a, mu_v_new)
-                
-                # Update scaling factors on incident edges.
-                for (nbr, edge, direction, weight) in neighbors[v]:
-                    if direction == 'in':
-                        v_factor = edge_scaling[edge]["v"]
-                        conv_val = modified_heat_kernel_convolution(v_factor * a, sigma, image_shape, comp_v, tau, gamma, N_v)
-                        d_e = edge_scaling[edge]["w"] * np.maximum(conv_val, 1e-16)
-                        edge_scaling[edge]["w"] = edge_scaling[edge]["w"] * (mu[v] / d_e)
-                    elif direction == 'out':
-                        w_factor = edge_scaling[edge]["w"]
-                        conv_val = modified_heat_kernel_convolution(w_factor * a, sigma, image_shape, comp_v, tau, gamma, N_v)
-                        d_e = edge_scaling[edge]["v"] * np.maximum(conv_val, 1e-16)
-                        edge_scaling[edge]["v"] = edge_scaling[edge]["v"] * (mu[v] / d_e)
-                        
-        # Convergence check on unknown vertices.
-        err = 0
-        count = 0
-        for v in vertices:
-            if v not in fixed:
-                err += np.linalg.norm(mu[v] - mu_prev[v], 1)
-                count += 1
-        avg_err = err / count if count > 0 else 0
-        if verbose:
-            print(f"Iteration {it+1}: Average L1 change on unknown vertices = {avg_err:.2e}")
-        if count > 0 and avg_err < tol:
-            if verbose:
-                print("Soft maps propagation converged.")
-            break
-            
-    return mu
-
-def entropy(mu, a):
-    """
-    Computes the differential entropy of a probability distribution mu,
-    with area weights a, using the formula
-       H(mu) = -∑_i a_i * mu_i * log(mu_i)
-    A small constant is used to avoid log(0).
-    
-    Parameters:
-      mu : 1D numpy array, assumed normalized (a^T mu = 1).
-      a  : 1D numpy array of area weights.
-    
-    Returns:
-      Entropy (a scalar).
-    """
-    eps = 1e-16
-    return -np.sum(a * mu * np.log(np.maximum(mu, eps)))
-
-def entropic_sharpening(mu, a, H0, tol=1e-6, max_iter=50):
-    """
-    Sharpens a distribution mu by raising it to a power beta, so that
-    the resulting distribution (after re-normalization) has entropy equal to H0.
-    If mu already has entropy less than or equal to H0, no sharpening is applied.
-    
-    Parameters:
-      mu      : 1D numpy array, the input distribution (assumed normalized: a^T mu = 1).
-      a       : 1D numpy array of area weights.
-      H0      : Desired entropy bound.
-      tol     : Tolerance for the bisection solver.
-      max_iter: Maximum iterations for the bisection method.
-      
-    Returns:
-      mu_sharp: The sharpened (and re-normalized) distribution.
-    """
-    current_entropy = entropy(mu, a)
-    # If the current entropy is already below or equal to H0, do nothing.
-    if current_entropy <= H0:
-        return mu
-    
-    # We want to find beta >= 1 such that the entropy of the re-normalized mu^beta is H0.
-    # Let mu_beta = (mu ** beta) normalized so that a^T mu_beta = 1.
-    def F(beta):
-        mu_beta = mu ** beta
-        mu_beta = mu_beta / np.dot(a, mu_beta)  # re-normalize
-        return entropy(mu_beta, a) - H0
-
-    # Since mu is smooth, F(1) = entropy(mu)-H0 > 0.
-    beta_low = 1.0
-    F_low = F(beta_low)
-    
-    # Find an upper bound beta_high so that F(beta_high) < 0.
-    beta_high = 2.0
-    while F(beta_high) > 0:
-        beta_high *= 2.0
-        if beta_high > 1e6:
-            # In case we cannot find a suitable beta_high, break.
-            break
-    F_high = F(beta_high)
-    
-    # Bisection to solve F(beta) = 0
-    for it in range(max_iter):
-        beta_mid = (beta_low + beta_high) / 2.0
-        F_mid = F(beta_mid)
-        if np.abs(F_mid) < tol:
-            beta = beta_mid
-            break
-        if F_mid > 0:
-            beta_low = beta_mid
-        else:
-            beta_high = beta_mid
-        beta = (beta_low + beta_high) / 2.0
     else:
-        print("Warning: entropic sharpening did not converge within the maximum iterations.")
+        if warn:
+            print("Warning: Convolutional Sinkhorn iterations did not converge. Consider increasing max_iterations or gamma.")
+
+    if log_output:
+        log["iterations"] = iteration
+        return barycenter, v, w, log
     
-    # Compute and return the sharpened distribution:
-    mu_sharp = mu ** beta
-    mu_sharp = mu_sharp / np.dot(a, mu_sharp)
-    return mu_sharp
+    return barycenter, v, w, heat_kernel
