@@ -1,12 +1,13 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
-from lib.algo import convolutional_wasserstein_barycenter
+from utils.algorithms import convolutional_wasserstein_barycenter
 from utils.shapes_2d import create_shape
 
 # Define grid size and gamma for heat kernel
 image_shape = (128, 128)
-gamma = 0.001  # Regularization parameter
+gamma = 0.02  # Regularization parameter
+sharpen_entropy = False
 entropy_reg = None  # Entropy regularization parameter
 interp_num = 5
 
@@ -54,8 +55,10 @@ for i in range(interp_num):
             axes[i, j].imshow(f4, cmap="gray")
         else:
             # Compute barycenter for intermediate shapes
-            mu_interp, _, _, _ = convolutional_wasserstein_barycenter(A, gamma, weights, stop_threshold=1e-5, verbose=True, entropy_sharpening=True, max_iterations=2000, H0=entropy_reg)
-            axes[i, j].imshow(mu_interp.reshape(image_shape), cmap="gray")
+            # mu_interp, _, _, _ = convolutional_wasserstein_barycenter(A, gamma, weights, stop_threshold=1e-5, verbose=True, entropy_sharpening=sharpen_entropy, max_iterations=2000, H0=entropy_reg)
+            mu_interp = convolutional_wasserstein_barycenter(A, weights, lr=0.01, max_iter=1000, tol=1e-5)
+            # mu_interp = cross_bilateral_wasserstein_barycenter_opencv(A, weights, verbose=True)
+            # axes[i, j].imshow(mu_interp.reshape(image_shape), cmap="gray")
 
         axes[i, j].axis("off")
 
