@@ -20,7 +20,7 @@ Using Wasserstein barycenters, we efficiently interpolate color distributions be
 #### **1.1 Effect of Weight on Color Transfer**
 The weight parameter controls the influence of the source and target histograms. Below is a comparison showing the gradual transition of color between two images under different weights.
 
-| ![Gradual Wight Transfer](results/color_transfer_interpolation.png)|
+| ![Gradual Wight Transfer](results/color_transfer_interpolation.jpg)|
 
 #### **1.2 Effect of KNN on Color Transfer**
 To optimize efficiency, we reduce histogram binning complexity from **O(n log² n)** to **O(n' log² n')** (where n' ≪ n), significantly improving speed. However, reducing bins too much can lead to **loss of detail**. We mitigate this by applying **K-Nearest Neighbors (KNN)**, which restores finer details while maintaining computational efficiency.
